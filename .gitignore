@@ -1,0 +1,36 @@
+# Output files - large video files
+Output/
+*.mov
+*.mp4
+*.mkv
+*.avi
+
+# Source footage - don't commit raw camera files
+Main Camera/
+Tripod Camera/
+Audio/
+*.TOD
+*.MOD
+*.MTS
+*.M2TS
+*.WAV
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
