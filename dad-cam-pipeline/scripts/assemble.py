@@ -72,6 +72,7 @@ class TimelineAssembler:
             "master_file": None,
             "timeline_fcpxml": None,
             "multicam_fcpxml": None,
+            "doc_edits": {},
         }
 
         # Get clip information
@@ -82,6 +83,15 @@ class TimelineAssembler:
             return results
 
         self.logger.info(f"Assembling {len(clips)} clips...")
+
+        # 0. Create per-camera doc edits (VHS-style continuous viewing)
+        with PhaseLogger("Creating Per-Camera Doc Edits", self.logger) as phase:
+            doc_edits = self._create_doc_edits(clips)
+            results["doc_edits"] = {k: str(v) for k, v in doc_edits.items()}
+            if doc_edits:
+                phase.success(f"Created {len(doc_edits)} doc edits")
+            else:
+                phase.success("No doc edits created (no camera-specific clips found)")
 
         # 1. Create concatenated master
         with PhaseLogger("Creating Master File", self.logger) as phase:
@@ -430,6 +440,183 @@ class TimelineAssembler:
             self.logger.error(f"Simple concat error: {e}")
             return None
 
+    def _create_doc_edits(self, clips: List[ClipInfo]) -> Dict[str, Path]:
+        """
+        Create separate 'doc edit' files for each camera source.
+
+        Doc edits are simple J/L cut concatenations of all clips from a single
+        camera, with original camera audio. Provides a VHS-style continuous
+        viewing experience per camera.
+
+        Returns dict of camera_name -> output_path
+        """
+        results = {}
+
+        # Separate clips by camera source using filename prefix
+        # Transcoder names files: dad_cam_XXX.mov (main) vs tripod_cam_XXX.mov (tripod)
+        main_clips = [c for c in clips if c.filename.startswith(self.config.output_prefix + "_")
+                      and not c.filename.startswith("tripod_cam")]
+        tripod_clips = [c for c in clips if c.filename.startswith("tripod_cam")]
+
+        self.logger.info(f"  Found {len(main_clips)} main camera clips, {len(tripod_clips)} tripod camera clips")
+
+        # Create main camera doc edit
+        if main_clips:
+            main_path = self.master_dir / f"{self.config.output_prefix}_main_camera_docedit.mov"
+            self.logger.info(f"  Creating main camera doc edit ({len(main_clips)} clips)...")
+            if self._create_doc_edit_for_camera(main_clips, main_path):
+                results["main_camera"] = main_path
+                info = probe_file(main_path)
+                if info:
+                    self.logger.info(f"    Duration: {info.duration/60:.1f} minutes")
+                    self.logger.info(f"    Size: {main_path.stat().st_size / (1024*1024*1024):.2f} GB")
+
+        # Create tripod camera doc edit
+        if tripod_clips:
+            tripod_path = self.master_dir / f"{self.config.output_prefix}_tripod_camera_docedit.mov"
+            self.logger.info(f"  Creating tripod camera doc edit ({len(tripod_clips)} clips)...")
+            if self._create_doc_edit_for_camera(tripod_clips, tripod_path):
+                results["tripod_camera"] = tripod_path
+                info = probe_file(tripod_path)
+                if info:
+                    self.logger.info(f"    Duration: {info.duration/60:.1f} minutes")
+                    self.logger.info(f"    Size: {tripod_path.stat().st_size / (1024*1024*1024):.2f} GB")
+
+        return results
+
+    def _create_doc_edit_for_camera(self, clips: List[ClipInfo], output_path: Path) -> bool:
+        """
+        Create a single doc edit file from clips with J/L audio crossfades.
+
+        Strategy:
+        1. Concat demuxer for video (stream copy - fast, no re-encode)
+        2. Extract and crossfade audio separately
+        3. Mux video + crossfaded audio together
+        """
+        if not clips:
+            return False
+
+        if len(clips) == 1:
+            # Single clip - just copy
+            import shutil
+            shutil.copy2(clips[0].path, output_path)
+            return True
+
+        # Fixed 1 second crossfade for all clips
+        crossfade_duration = 1.0
+
+        # Step 1: Concat video only (stream copy)
+        concat_list = self.config.analysis_dir / "docedit_concat.txt"
+        video_only = self.config.analysis_dir / "docedit_video.mov"
+
+        with open(concat_list, 'w') as f:
+            for clip in clips:
+                escaped = str(clip.path).replace("'", "'\\''")
+                f.write(f"file '{escaped}'\n")
+
+        cmd_video = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', str(concat_list),
+            '-c:v', 'copy',
+            '-an',  # No audio
+            str(video_only)
+        ]
+
+        try:
+            result = subprocess.run(cmd_video, capture_output=True, text=True, timeout=3600)
+            if result.returncode != 0:
+                self.logger.error(f"Video concat failed: {result.stderr[-500:]}")
+                concat_list.unlink(missing_ok=True)
+                return False
+
+            # Step 2: Build audio crossfade filter
+            # For N clips, chain N-1 acrossfade filters
+            input_args = []
+            for clip in clips:
+                input_args.extend(['-i', str(clip.path)])
+
+            # Build audio crossfade chain
+            if len(clips) == 2:
+                filter_complex = f"[0:a][1:a]acrossfade=d={crossfade_duration}:c1=esin:c2=esin[aout]"
+            else:
+                filter_parts = []
+                current = "[0:a]"
+                for i in range(1, len(clips)):
+                    next_audio = f"[{i}:a]"
+                    if i == len(clips) - 1:
+                        out_label = "[aout]"
+                    else:
+                        out_label = f"[a{i}]"
+                    filter_parts.append(f"{current}{next_audio}acrossfade=d={crossfade_duration}:c1=esin:c2=esin{out_label}")
+                    current = out_label
+                filter_complex = ";".join(filter_parts)
+
+            # Step 3: Create crossfaded audio
+            audio_only = self.config.analysis_dir / "docedit_audio.m4a"
+            cmd_audio = ['ffmpeg', '-y']
+            cmd_audio.extend(input_args)
+            cmd_audio.extend([
+                '-filter_complex', filter_complex,
+                '-map', '[aout]',
+                '-c:a', 'aac',
+                '-b:a', '256k',
+                str(audio_only)
+            ])
+
+            result = subprocess.run(cmd_audio, capture_output=True, text=True, timeout=3600)
+            if result.returncode != 0:
+                self.logger.error(f"Audio crossfade failed: {result.stderr[-500:]}")
+                # Fallback: just concat without crossfades
+                video_only.unlink(missing_ok=True)
+                return self._create_doc_edit_simple(clips, output_path, concat_list)
+
+            # Step 4: Mux video + audio together
+            cmd_mux = [
+                'ffmpeg', '-y',
+                '-i', str(video_only),
+                '-i', str(audio_only),
+                '-c:v', 'copy',
+                '-c:a', 'copy',
+                '-movflags', '+faststart',
+                str(output_path)
+            ]
+
+            result = subprocess.run(cmd_mux, capture_output=True, text=True, timeout=1800)
+
+            # Cleanup temp files
+            video_only.unlink(missing_ok=True)
+            audio_only.unlink(missing_ok=True)
+            concat_list.unlink(missing_ok=True)
+
+            if result.returncode != 0:
+                self.logger.error(f"Mux failed: {result.stderr[-500:]}")
+                return False
+
+            return output_path.exists()
+
+        except Exception as e:
+            self.logger.error(f"Doc edit failed: {e}")
+            concat_list.unlink(missing_ok=True)
+            video_only.unlink(missing_ok=True) if video_only.exists() else None
+            return False
+
+    def _create_doc_edit_simple(self, clips: List[ClipInfo], output_path: Path, concat_list: Path) -> bool:
+        """Fallback: simple concat without crossfades."""
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', str(concat_list),
+            '-c', 'copy',
+            '-movflags', '+faststart',
+            str(output_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        concat_list.unlink(missing_ok=True)
+        return result.returncode == 0 and output_path.exists()
+
     def _generate_fcpxml(self, clips: List[ClipInfo]) -> Optional[Path]:
         """
         Generate FCPXML timeline for import into NLEs.
@@ -521,11 +708,11 @@ class TimelineAssembler:
         tree = ET.ElementTree(fcpxml)
         ET.indent(tree, space="  ")
 
-        # Add XML declaration
-        with open(fcpxml_path, 'wb') as f:
-            f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
-            f.write(b'<!DOCTYPE fcpxml>\n')
-            tree.write(f, encoding='unicode' if sys.version_info >= (3, 8) else 'utf-8')
+        # Add XML declaration - use text mode for compatibility
+        with open(fcpxml_path, 'w', encoding='utf-8') as f:
+            f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+            f.write('<!DOCTYPE fcpxml>\n')
+            tree.write(f, encoding='unicode')
 
         return fcpxml_path
 
@@ -638,10 +825,10 @@ class TimelineAssembler:
         tree = ET.ElementTree(fcpxml)
         ET.indent(tree, space="  ")
 
-        with open(fcpxml_path, 'wb') as f:
-            f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
-            f.write(b'<!DOCTYPE fcpxml>\n')
-            tree.write(f, encoding='unicode' if sys.version_info >= (3, 8) else 'utf-8')
+        with open(fcpxml_path, 'w', encoding='utf-8') as f:
+            f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+            f.write('<!DOCTYPE fcpxml>\n')
+            tree.write(f, encoding='unicode')
 
         return fcpxml_path
 

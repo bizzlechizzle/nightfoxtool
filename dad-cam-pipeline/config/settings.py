@@ -177,6 +177,8 @@ class PipelineConfig:
     # Processing options
     parallel_jobs: int = 2  # Conservative default for H.265 encoding
     skip_transcode: bool = False
+    skip_analysis: bool = False
+    skip_audio: bool = False
     skip_multicam: bool = False
     dry_run: bool = False
 

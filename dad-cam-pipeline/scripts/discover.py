@@ -147,20 +147,36 @@ class SourceDiscovery:
 
             return inventory
 
+    # Directories to exclude from scanning
+    EXCLUDE_DIRS = {'.venv', 'venv', 'node_modules', '.git', 'Output', 'dad-cam-pipeline', '__pycache__'}
+
+    def _should_exclude(self, path: Path) -> bool:
+        """Check if path should be excluded from scanning."""
+        parts = path.parts
+        return any(excl in parts for excl in self.EXCLUDE_DIRS)
+
     def _find_video_files(self) -> List[Path]:
-        """Find all video files recursively."""
+        """Find all video files recursively, excluding output and venv dirs."""
         files = []
         for ext in self.VIDEO_EXTENSIONS:
-            files.extend(self.source_dir.rglob(f"*{ext}"))
-            files.extend(self.source_dir.rglob(f"*{ext.upper()}"))
+            for f in self.source_dir.rglob(f"*{ext}"):
+                if not self._should_exclude(f):
+                    files.append(f)
+            for f in self.source_dir.rglob(f"*{ext.upper()}"):
+                if not self._should_exclude(f):
+                    files.append(f)
         return sorted(set(files), key=natural_sort_key)
 
     def _find_audio_files(self) -> List[Path]:
-        """Find all audio files recursively."""
+        """Find all audio files recursively, excluding output and venv dirs."""
         files = []
         for ext in self.AUDIO_EXTENSIONS:
-            files.extend(self.source_dir.rglob(f"*{ext}"))
-            files.extend(self.source_dir.rglob(f"*{ext.upper()}"))
+            for f in self.source_dir.rglob(f"*{ext}"):
+                if not self._should_exclude(f):
+                    files.append(f)
+            for f in self.source_dir.rglob(f"*{ext.upper()}"):
+                if not self._should_exclude(f):
+                    files.append(f)
         return sorted(set(files), key=natural_sort_key)
 
     def _categorize_video_sources(self, video_files: List[Path]) -> Tuple[List[Path], List[Path]]:

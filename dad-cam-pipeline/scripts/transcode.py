@@ -263,9 +263,12 @@ class BatchTranscoder:
             self.logger.warning(f"Source file not found: {input_path}")
             return None
 
-        # Generate output filename
+        # Generate output filename based on camera type
         order = clip.get("order", 0)
-        output_name = f"{self.config.output_prefix}_{order:03d}.mov"
+        if camera_type == "tripod":
+            output_name = f"tripod_cam_{order:03d}.mov"
+        else:
+            output_name = f"{self.config.output_prefix}_{order:03d}.mov"
         output_path = self.clips_dir / output_name
 
         # Build video filters

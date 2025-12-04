@@ -73,17 +73,21 @@ class DadCamPipeline:
         self._print_banner()
 
         try:
-            # Phase 1: Discovery
-            if not self._run_discovery():
-                return 1
+            # Phase 1-3: Discovery, Analysis, Shot Detection
+            if not self.config.skip_analysis:
+                # Phase 1: Discovery
+                if not self._run_discovery():
+                    return 1
 
-            # Phase 2: Analysis (stuck pixels, black frames, stability)
-            if not self._run_analysis():
-                return 1
+                # Phase 2: Analysis (stuck pixels, black frames, stability)
+                if not self._run_analysis():
+                    return 1
 
-            # Phase 3: Shot Detection (TransNet V2)
-            if not self._run_shot_detection():
-                self.logger.warning("Shot detection failed - continuing with basic switching")
+                # Phase 3: Shot Detection (TransNet V2)
+                if not self._run_shot_detection():
+                    self.logger.warning("Shot detection failed - continuing with basic switching")
+            else:
+                self.logger.info("Skipping phases 1-3 (--skip-analysis) - using existing analysis data")
 
             # Check for dry run
             if self.config.dry_run:
@@ -99,8 +103,11 @@ class DadCamPipeline:
                 self.logger.info("Skipping transcode (--skip-transcode)")
 
             # Phase 5: Audio Processing
-            if not self._run_audio_process():
-                return 1
+            if not self.config.skip_audio:
+                if not self._run_audio_process():
+                    return 1
+            else:
+                self.logger.info("Skipping audio processing (--skip-audio)")
 
             # Phase 6: Multicam Sync
             if not self.config.skip_multicam:
@@ -413,9 +420,19 @@ Examples:
         help="Skip transcoding phase"
     )
     parser.add_argument(
+        "--skip-analysis",
+        action="store_true",
+        help="Skip phases 1-3 (use existing analysis data)"
+    )
+    parser.add_argument(
         "--skip-multicam",
         action="store_true",
         help="Skip multicam synchronization"
+    )
+    parser.add_argument(
+        "--skip-audio",
+        action="store_true",
+        help="Skip audio processing phase"
     )
     parser.add_argument(
         "--dry-run",
@@ -456,6 +473,8 @@ Examples:
     if args.parallel:
         config.parallel_jobs = args.parallel
     config.skip_transcode = args.skip_transcode
+    config.skip_analysis = args.skip_analysis
+    config.skip_audio = args.skip_audio
     config.skip_multicam = args.skip_multicam
     config.dry_run = args.dry_run
 

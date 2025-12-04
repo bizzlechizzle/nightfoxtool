@@ -75,7 +75,18 @@ class AudioProcessor:
 
         # Build summary
         hum_detected = sum(1 for r in results if r.get("hum_removed", False))
-        avg_lufs = sum(r.get("final_lufs", -14) for r in results) / len(results) if results else -14
+        # Calculate average LUFS, handling None and string values
+        lufs_values = []
+        for r in results:
+            val = r.get("final_lufs")
+            if val is not None:
+                try:
+                    lufs_values.append(float(val))
+                except (ValueError, TypeError):
+                    lufs_values.append(-14.0)
+            else:
+                lufs_values.append(-14.0)
+        avg_lufs = sum(lufs_values) / len(lufs_values) if lufs_values else -14.0
 
         summary = {
             "total_clips": len(clips),
@@ -111,7 +122,10 @@ class AudioProcessor:
             # Step 2: Measure original loudness
             loudness = self._measure_loudness_pass1(clip_path)
             if loudness:
-                result["original_lufs"] = loudness.get("input_i")
+                try:
+                    result["original_lufs"] = float(loudness.get("input_i", -14))
+                except (ValueError, TypeError):
+                    result["original_lufs"] = -14.0
 
             # Step 3: Build complete audio filter chain
             audio_filters = []
@@ -138,7 +152,10 @@ class AudioProcessor:
                 # Verify final loudness
                 final_loudness = self._measure_loudness_pass1(clip_path)
                 if final_loudness:
-                    result["final_lufs"] = final_loudness.get("input_i")
+                    try:
+                        result["final_lufs"] = float(final_loudness.get("input_i", -14))
+                    except (ValueError, TypeError):
+                        result["final_lufs"] = -14.0
                 result["success"] = True
             else:
                 result["error"] = "Failed to apply audio filters"

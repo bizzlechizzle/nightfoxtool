@@ -475,3 +475,296 @@ This runs discovery and analysis without processing.
 
 - Working directory needs ~2x source size
 - Final output: ~40-60% of source size
+
+---
+
+# CRITICAL FIX: Assembly Decision Application
+
+**Date Added:** December 4, 2025
+**Related:** AUDIT_REPORT.md, FIX_PLAN.md
+
+## The Problem
+
+The pipeline generates intelligent decision files (audio mix, multicam edits, sync offsets) but the assembly phase **NEVER USES THEM**. This causes:
+- Audio gaps (lapel mic not used)
+- No camera switching (multicam decisions ignored)
+- Sync issues (offsets not applied)
+
+See `AUDIT_REPORT.md` for full details.
+
+---
+
+## Quick Fix Guide for Developers
+
+### Prerequisites
+- Read `AUDIT_REPORT.md` to understand the issues
+- Read `FIX_PLAN.md` for the detailed plan
+- Back up `scripts/assemble.py` before making changes
+
+### Step-by-Step Implementation
+
+#### 1. Load Decision Files in `__init__` (5 min)
+
+**Location:** `scripts/assemble.py`, inside `__init__`, after line 59
+
+```python
+# Load decision files for assembly
+self.audio_mix_decisions = None
+self.multicam_decisions = None
+self.sync_offsets = None
+self._source_to_order_map = None
+
+audio_mix_path = config.analysis_dir / "audio_mix_decisions.json"
+multicam_path = config.analysis_dir / "multicam_edit_decisions.json"
+sync_path = config.analysis_dir / "sync_offsets.json"
+
+if audio_mix_path.exists():
+    self.audio_mix_decisions = load_json(audio_mix_path)
+    self.logger.info(f"Loaded {len(self.audio_mix_decisions.get('segments', []))} audio mix segments")
+
+if multicam_path.exists():
+    self.multicam_decisions = load_json(multicam_path)
+    self.logger.info(f"Loaded {len(self.multicam_decisions.get('decisions', []))} multicam decisions")
+
+if sync_path.exists():
+    self.sync_offsets = load_json(sync_path)
+```
+
+#### 2. Add Timeline Mapping Helper (5 min)
+
+**Location:** After `_gather_clips` method
+
+```python
+def _build_timeline_clip_map(self, clips: List[ClipInfo]) -> Dict:
+    """Build a mapping from timeline position to clip info."""
+    boundaries = []
+    timeline_pos = 0.0
+    clips_by_order = {}
+
+    for clip in clips:
+        start = timeline_pos
+        end = timeline_pos + clip.duration
+        boundaries.append((start, end, clip))
+        clips_by_order[clip.order] = clip
+        timeline_pos = end
+
+    return {
+        "clip_boundaries": boundaries,
+        "total_duration": timeline_pos,
+        "clips_by_order": clips_by_order
+    }
+
+def _find_clip_at_time(self, time: float, timeline_map: Dict) -> Optional[ClipInfo]:
+    """Find which clip is playing at a given timeline position."""
+    for start, end, clip in timeline_map["clip_boundaries"]:
+        if start <= time < end:
+            return clip
+    return None
+
+def _get_clip_start_time(self, clip: ClipInfo, timeline_map: Dict) -> float:
+    """Get the timeline start position for a clip."""
+    for start, end, c in timeline_map["clip_boundaries"]:
+        if c.order == clip.order:
+            return start
+    return 0.0
+```
+
+#### 3. Add Source-to-Clip Mapper (10 min)
+
+This maps original source paths (e.g., `MOV008.TOD`) to transcoded clips (e.g., `dad_cam_001.mov`).
+
+```python
+def _find_transcoded_clip(self, original_path: str, clips: List[ClipInfo]) -> Optional[ClipInfo]:
+    """Find the transcoded clip for an original source file."""
+    # Build mapping on first call
+    if self._source_to_order_map is None:
+        self._source_to_order_map = {}
+        inventory_path = self.config.analysis_dir / "inventory.json"
+        if inventory_path.exists():
+            inventory = load_json(inventory_path)
+            for clip_data in inventory.get("main_camera", []):
+                self._source_to_order_map[clip_data["original_path"]] = clip_data["order"]
+            for clip_data in inventory.get("tripod_camera", []):
+                self._source_to_order_map[clip_data["original_path"]] = clip_data["order"]
+
+    order = self._source_to_order_map.get(original_path)
+    if order is None:
+        return None
+
+    expected = f"{self.config.output_prefix}_{order:03d}.mov"
+    for clip in clips:
+        if clip.filename == expected:
+            return clip
+
+    expected_tripod = f"tripod_cam_{order:03d}.mov"
+    for clip in clips:
+        if clip.filename == expected_tripod:
+            return clip
+
+    return None
+```
+
+#### 4. Add Doc Edit Feature (15 min)
+
+Creates per-camera files as a quick win.
+
+```python
+def _create_doc_edits(self, clips: List[ClipInfo]) -> Dict[str, Path]:
+    """Create separate doc edit files for each camera."""
+    results = {}
+
+    main_clips = [c for c in clips if c.filename.startswith(self.config.output_prefix)]
+    tripod_clips = [c for c in clips if c.filename.startswith("tripod_cam")]
+
+    if main_clips:
+        main_path = self.master_dir / f"{self.config.output_prefix}_main_camera_docedit.mov"
+        if self._create_doc_edit_simple(main_clips, main_path):
+            results["main_camera"] = main_path
+
+    if tripod_clips:
+        tripod_path = self.master_dir / f"{self.config.output_prefix}_tripod_camera_docedit.mov"
+        if self._create_doc_edit_simple(tripod_clips, tripod_path):
+            results["tripod_camera"] = tripod_path
+
+    return results
+
+def _create_doc_edit_simple(self, clips: List[ClipInfo], output_path: Path) -> bool:
+    """Simple concat for doc edit."""
+    concat_list = self.config.analysis_dir / "docedit_concat.txt"
+    with open(concat_list, 'w') as f:
+        for clip in clips:
+            escaped = str(clip.path).replace("'", "'\\''")
+            f.write(f"file '{escaped}'\n")
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 'concat', '-safe', '0',
+        '-i', str(concat_list),
+        '-c', 'copy',
+        '-movflags', '+faststart',
+        str(output_path)
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=7200)
+    concat_list.unlink(missing_ok=True)
+    return result.returncode == 0
+```
+
+#### 5. Update `assemble_all` Flow (10 min)
+
+Add doc edits to the assembly flow:
+
+```python
+# After gathering clips:
+clips = self._gather_clips()
+timeline_map = self._build_timeline_clip_map(clips)
+
+# Add doc edit creation:
+with PhaseLogger("Creating Per-Camera Doc Edits", self.logger) as phase:
+    doc_edits = self._create_doc_edits(clips)
+    results["doc_edits"] = {k: str(v) for k, v in doc_edits.items()}
+    if doc_edits:
+        phase.success(f"Created {len(doc_edits)} doc edits")
+```
+
+---
+
+## Testing Your Changes
+
+```bash
+cd /Volumes/Jay/Dad\ Cam/dad-cam-pipeline
+source .venv/bin/activate
+
+# Quick test with skip flags
+python dad_cam_pipeline.py \
+  --source "/Volumes/Jay/Dad Cam" \
+  --output "/Volumes/Jay/Dad Cam/Output" \
+  --skip-transcode --skip-audio
+
+# Check for doc edits
+ls -la "/Volumes/Jay/Dad Cam/Output/master/"
+```
+
+---
+
+## Common Debug Patterns
+
+### Check If Decision Files Are Loading
+```python
+# Add to assemble_all after loading:
+self.logger.info(f"Audio decisions: {self.audio_mix_decisions is not None}")
+self.logger.info(f"Multicam decisions: {self.multicam_decisions is not None}")
+```
+
+### Verify Clip Mapping
+```python
+# Test source-to-clip mapping:
+test_path = "/Volumes/Jay/Dad Cam/Main Camera/PRG014/MOV008.TOD"
+found = self._find_transcoded_clip(test_path, clips)
+self.logger.info(f"Mapping test: {test_path} -> {found.filename if found else 'NOT FOUND'}")
+```
+
+### Check FFmpeg Errors
+```python
+result = subprocess.run(cmd, capture_output=True, text=True, ...)
+if result.returncode != 0:
+    self.logger.error(f"FFmpeg failed: {result.stderr[-500:]}")
+```
+
+---
+
+## Reference: Decision File Formats
+
+### audio_mix_decisions.json
+```json
+{
+  "segments": [
+    {
+      "start_time": 0.0,
+      "end_time": 49.0,
+      "primary_source": "/path/to/lapel.wav",
+      "source_type": "lapel",
+      "gain_db": 0.0
+    }
+  ]
+}
+```
+
+### multicam_edit_decisions.json
+```json
+{
+  "decisions": [
+    {
+      "timeline_start": 123.168,
+      "timeline_end": 156.72,
+      "source_camera": "tripod",
+      "source_clip": "/path/to/00000.MTS",
+      "source_start": 124.28
+    }
+  ]
+}
+```
+
+### sync_offsets.json
+```json
+{
+  "sources": {
+    "main_camera": {
+      "offset_seconds": 22.796625
+    },
+    "tripod_camera": {
+      "offset_seconds": -1.1175
+    }
+  }
+}
+```
+
+---
+
+## Next Steps After Basic Fix
+
+1. Implement `_apply_audio_mix` for full audio mixing
+2. Implement `_apply_multicam_edits` for camera switching
+3. Fix `_generate_multicam_fcpxml` to use actual decisions
+4. Add AAC validation to catch corruption early
+
+See `FIX_PLAN.md` for complete implementation details.
