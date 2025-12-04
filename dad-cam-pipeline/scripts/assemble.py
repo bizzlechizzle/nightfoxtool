@@ -502,8 +502,15 @@ class TimelineAssembler:
             shutil.copy2(clips[0].path, output_path)
             return True
 
-        # Fixed 1 second crossfade for all clips
-        crossfade_duration = 1.0
+        # Dynamic crossfade based on clip duration
+        # Short clips (<30s): 0.5s, Medium (30s+): 1s, Long (60s+): 2s
+        def get_crossfade(duration: float) -> float:
+            if duration < 30:
+                return 0.5
+            elif duration < 60:
+                return 1.0
+            else:
+                return 2.0
 
         # Step 1: Concat video only (stream copy)
         concat_list = self.config.analysis_dir / "docedit_concat.txt"
@@ -537,9 +544,11 @@ class TimelineAssembler:
             for clip in clips:
                 input_args.extend(['-i', str(clip.path)])
 
-            # Build audio crossfade chain
+            # Build audio crossfade chain with dynamic durations
             if len(clips) == 2:
-                filter_complex = f"[0:a][1:a]acrossfade=d={crossfade_duration}:c1=esin:c2=esin[aout]"
+                # Use shorter clip's duration for crossfade
+                fade = min(get_crossfade(clips[0].duration), get_crossfade(clips[1].duration))
+                filter_complex = f"[0:a][1:a]acrossfade=d={fade}:c1=esin:c2=esin[aout]"
             else:
                 filter_parts = []
                 current = "[0:a]"
@@ -549,7 +558,9 @@ class TimelineAssembler:
                         out_label = "[aout]"
                     else:
                         out_label = f"[a{i}]"
-                    filter_parts.append(f"{current}{next_audio}acrossfade=d={crossfade_duration}:c1=esin:c2=esin{out_label}")
+                    # Use shorter of two clips for crossfade duration
+                    fade = min(get_crossfade(clips[i-1].duration), get_crossfade(clips[i].duration))
+                    filter_parts.append(f"{current}{next_audio}acrossfade=d={fade}:c1=esin:c2=esin{out_label}")
                     current = out_label
                 filter_complex = ";".join(filter_parts)
 
@@ -572,26 +583,50 @@ class TimelineAssembler:
                 video_only.unlink(missing_ok=True)
                 return self._create_doc_edit_simple(clips, output_path, concat_list)
 
-            # Step 4: Mux video + audio together
+            # Step 4: Mux video + audio, then normalize audio
+            # First mux to temp file
+            temp_muxed = self.config.analysis_dir / "docedit_temp_muxed.mov"
             cmd_mux = [
                 'ffmpeg', '-y',
                 '-i', str(video_only),
                 '-i', str(audio_only),
                 '-c:v', 'copy',
                 '-c:a', 'copy',
+                str(temp_muxed)
+            ]
+
+            result = subprocess.run(cmd_mux, capture_output=True, text=True, timeout=1800)
+            if result.returncode != 0:
+                self.logger.error(f"Mux failed: {result.stderr[-500:]}")
+                video_only.unlink(missing_ok=True)
+                audio_only.unlink(missing_ok=True)
+                concat_list.unlink(missing_ok=True)
+                return False
+
+            # Step 5: Normalize audio loudness across entire doc edit
+            # Use EBU R128 loudness normalization (-14 LUFS is standard for streaming)
+            self.logger.info("    Normalizing audio loudness...")
+            cmd_normalize = [
+                'ffmpeg', '-y',
+                '-i', str(temp_muxed),
+                '-c:v', 'copy',
+                '-af', 'loudnorm=I=-14:TP=-1.5:LRA=11',
+                '-c:a', 'aac',
+                '-b:a', '256k',
                 '-movflags', '+faststart',
                 str(output_path)
             ]
 
-            result = subprocess.run(cmd_mux, capture_output=True, text=True, timeout=1800)
+            result = subprocess.run(cmd_normalize, capture_output=True, text=True, timeout=3600)
 
             # Cleanup temp files
             video_only.unlink(missing_ok=True)
             audio_only.unlink(missing_ok=True)
             concat_list.unlink(missing_ok=True)
+            temp_muxed.unlink(missing_ok=True)
 
             if result.returncode != 0:
-                self.logger.error(f"Mux failed: {result.stderr[-500:]}")
+                self.logger.error(f"Normalize failed: {result.stderr[-500:]}")
                 return False
 
             return output_path.exists()

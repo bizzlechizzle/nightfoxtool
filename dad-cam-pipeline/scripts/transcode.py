@@ -482,6 +482,9 @@ def transcode_worker(job: TranscodeJob, config: PipelineConfig) -> Tuple[bool, s
     # Container options
     cmd.extend(["-movflags", "+faststart"])
 
+    # Force audio to match video duration (prevents drift)
+    cmd.append("-shortest")
+
     # Output
     cmd.append(str(job.output_path))
 

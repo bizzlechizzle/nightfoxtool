@@ -80,10 +80,12 @@ Output/
 | File | Changes |
 |------|---------|
 | `scripts/assemble.py` | Added doc edit feature with J/L crossfades |
-| `scripts/transcode.py` | Fixed float conversion for progress bar |
+| `scripts/transcode.py` | Added -shortest flag to prevent audio/video drift |
+| `scripts/fix_audio_sync.py` | NEW: Fix existing clips with audio drift using atrim |
 | `scripts/audio_process.py` | Fixed FCPXML encoding (text mode) |
 | `dad_cam_pipeline.py` | Added --skip-audio flag |
 | `AUDIT_REPORT.md` | Documents 10 critical issues with pipeline |
+| `AUDIO_SYNC_FIX.md` | Implementation guide for audio sync fix |
 | `FIX_PLAN.md` | Detailed fix plan for decision application |
 | `IMPLEMENTATION_GUIDE.md` | Step-by-step guide for developers |
 
@@ -93,3 +95,12 @@ Output/
 2. Multicam edit decisions generated but never applied
 3. Sync offsets never applied during assembly
 4. Master uses simple concat, not intelligent mixing
+
+## Current Work In Progress
+
+**Audio Sync Fix (WIP - NOT COMPLETE)**
+- Added `-shortest` flag to transcode.py
+- Created fix_audio_sync.py script using atrim filter
+- Fixed 71/119 clips (4.7s drift eliminated)
+- Doc edits regenerated but **still have issues**
+- Need to debug remaining sync/crossfade problems
