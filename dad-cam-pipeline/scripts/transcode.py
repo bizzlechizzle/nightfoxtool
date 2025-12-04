@@ -475,9 +475,14 @@ def transcode_worker(job: TranscodeJob, config: PipelineConfig) -> Tuple[bool, s
     cmd.extend(["-color_trc", "bt709"])
     cmd.extend(["-colorspace", "bt709"])
 
-    # Audio encoding
+    # Audio encoding with drift correction
+    # aresample=48000:async=1 resamples to 48kHz AND corrects A/V drift
+    cmd.extend(["-af", "aresample=48000:async=1"])
     cmd.extend(["-c:a", "aac"])
     cmd.extend(["-b:a", "256k"])
+
+    # Constant frame rate to prevent VFR drift
+    cmd.extend(["-vsync", "cfr"])
 
     # Container options
     cmd.extend(["-movflags", "+faststart"])

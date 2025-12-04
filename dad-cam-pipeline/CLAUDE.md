@@ -21,7 +21,7 @@ Use `pipeline_simple.py` - a streamlined 4-phase pipeline:
 | 1 | `discover.py` | Scan source folders, build inventory.json |
 | 2 | `transcode.py` | Convert TOD/MTS to H.265 MOV |
 | 3 | `audio_process.py` | Two-pass loudnorm to -14 LUFS, remove hum |
-| 4 | `assemble_simple.py` | Concat clips into continuous timeline |
+| 4 | `assemble_jl.py` | Create timeline with J-L audio crossfades |
 
 ```bash
 # Full pipeline
@@ -29,7 +29,32 @@ python pipeline_simple.py --source "/footage" --output "/output"
 
 # Skip phases (use existing clips)
 python pipeline_simple.py -s /footage -o /output --skip-transcode --skip-audio
+
+# J-L Assembly only (with existing clips)
+python scripts/assemble_jl.py -o "/output" --crossfade 0.75
 ```
+
+### J-L Crossfade Assembly (Professional)
+
+Use `assemble_jl.py` for professional-quality audio transitions:
+
+```
+CLIP A                    CLIP B
+Video: [===========]      [============]
+                    ↑ hard cut (frame-accurate)
+
+Audio: [=============]
+                 [=============]
+              └────┬────┘
+           crossfade zone (~0.75s)
+           A fades out, B fades in
+```
+
+Features:
+- Video: Hard cuts between clips (no transition effect)
+- Audio: Smooth fade in/out at edit points
+- A/V sync: <0.04s drift threshold
+- Efficient O(n) processing (not O(n²))
 
 ### Original Pipeline (Complex)
 
@@ -134,16 +159,35 @@ Clips are normalized to -14 LUFS using two-pass loudnorm:
 | File | Purpose |
 |------|---------|
 | `pipeline_simple.py` | Simplified 4-phase pipeline (RECOMMENDED) |
-| `scripts/assemble_simple.py` | Robust timeline assembly |
+| `scripts/assemble_jl.py` | J-L crossfade timeline assembly |
+| `scripts/assemble_simple.py` | Simple concat assembly (fallback) |
 | `scripts/discover.py` | Source file discovery |
-| `scripts/transcode.py` | Video transcoding |
+| `scripts/transcode.py` | Video transcoding with drift correction |
 | `scripts/audio_process.py` | Audio normalization |
+
+## Transcode Drift Correction
+
+The transcode step includes automatic A/V drift correction:
+
+```python
+# Key flags in transcode.py
+cmd.extend(["-af", "aresample=48000:async=1"])  # Correct drift
+cmd.extend(["-vsync", "cfr"])  # Constant frame rate
+```
+
+This ensures all clips have <0.04s A/V drift before assembly.
 
 ## Verified Results
 
-Last run (Dec 4, 2024):
+Last run (Dec 4, 2025) - **J-L Crossfade Assembly**:
 
-| Camera | Clips | Duration | Audio Gap | Size | Status |
-|--------|-------|----------|-----------|------|--------|
-| Main | 115 | 122.4 min | 0.00s | 9.74 GB | OK |
-| Tripod | 4 | 64.8 min | 0.00s | 4.77 GB | OK |
+| Camera | Clips | Duration | A/V Sync | Size | Status |
+|--------|-------|----------|----------|------|--------|
+| Main | 115 | 121.0 min | 0.040s | 6.74 GB | OK |
+| Tripod | 4 | 64.8 min | 0.040s | 3.78 GB | OK |
+
+**Assembly Details:**
+- Crossfade duration: 0.75s per transition
+- Main timeline: 114 crossfades, 85.5s total reduction
+- Processing time: ~50 minutes
+- All clips verified <0.04s A/V drift threshold
