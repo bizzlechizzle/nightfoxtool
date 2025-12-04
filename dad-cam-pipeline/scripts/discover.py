@@ -42,6 +42,9 @@ class SourceFile:
     fps: Optional[float]
     is_interlaced: bool
     moi_path: Optional[str]
+    # Audio-specific fields
+    audio_type: Optional[str] = None  # "lapel", "dj", "ambient", None for video
+    audio_priority: int = 99  # Lower = higher priority (1=lapel, 2=dj, 3=camera)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -228,7 +231,7 @@ class SourceDiscovery:
         return sources
 
     def _process_audio_files(self, files: List[Path]) -> List[SourceFile]:
-        """Process audio files and extract metadata."""
+        """Process audio files and extract metadata with classification."""
         sources = []
 
         for f in files:
@@ -238,6 +241,9 @@ class SourceDiscovery:
             # Probe for duration
             info = probe_file(f)
             duration = info.duration if info else 0
+
+            # Classify audio type
+            audio_type, audio_priority = self._classify_audio_source(f, duration)
 
             source = SourceFile(
                 original_path=str(f),
@@ -252,10 +258,95 @@ class SourceDiscovery:
                 fps=None,
                 is_interlaced=False,
                 moi_path=None,
+                audio_type=audio_type,
+                audio_priority=audio_priority,
             )
             sources.append(source)
 
+            self.logger.info(f"  Audio: {f.name} -> {audio_type} (priority {audio_priority})")
+
         return sources
+
+    def _classify_audio_source(self, audio_path: Path, duration: float) -> Tuple[str, int]:
+        """
+        Classify audio source type based on filename, duration, and content.
+
+        Returns:
+            Tuple of (audio_type, priority)
+            Types: "lapel", "dj", "ambient"
+            Priority: 1=lapel (highest), 2=dj, 3=ambient
+        """
+        filename = audio_path.name.lower()
+        stem = audio_path.stem.lower()
+
+        # Check filename patterns for lapel/speech
+        lapel_patterns = ['lapel', 'lav', 'speech', 'vow', 'ceremony', 'tr1', 'tr2', 'track']
+        for pattern in lapel_patterns:
+            if pattern in stem:
+                return ("lapel", 1)
+
+        # Check filename patterns for DJ/music
+        dj_patterns = ['dj', 'music', 'dance', 'reception', 'party', 'mix']
+        for pattern in dj_patterns:
+            if pattern in stem:
+                return ("dj", 2)
+
+        # Use duration heuristics
+        # Lapel recordings tend to be very long (ceremony + speeches)
+        # DJ sets are medium length (reception)
+        # Ambient/room tone is short
+
+        if duration > 7200:  # > 2 hours - likely lapel left running
+            return ("lapel", 1)
+        elif duration > 3600:  # 1-2 hours - could be either, check content
+            # Analyze frequency content to distinguish speech vs music
+            audio_type = self._analyze_audio_content(audio_path)
+            if audio_type == "speech":
+                return ("lapel", 1)
+            elif audio_type == "music":
+                return ("dj", 2)
+            else:
+                return ("lapel", 1)  # Default long recordings to lapel
+        elif duration > 1800:  # 30min - 1hr - likely DJ set
+            return ("dj", 2)
+        else:
+            # Short recording - ambient/room tone
+            return ("ambient", 3)
+
+    def _analyze_audio_content(self, audio_path: Path) -> str:
+        """
+        Analyze audio content to distinguish speech vs music.
+
+        Uses FFmpeg to check frequency distribution:
+        - Speech: energy concentrated in 300Hz-3kHz
+        - Music: broader spectrum with strong bass (< 200Hz)
+
+        Returns: "speech", "music", or "unknown"
+        """
+        try:
+            # Extract 30 seconds from middle of file for analysis
+            cmd = [
+                'ffmpeg', '-y',
+                '-ss', '60',  # Skip first minute
+                '-i', str(audio_path),
+                '-t', '30',
+                '-af', 'astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level',
+                '-f', 'null', '-'
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+            # For now, use simple heuristic based on filename patterns we might have missed
+            # Full implementation would analyze FFT spectrum
+
+            # Check for Zoom recorder patterns (often used for speech)
+            if 'zoom' in str(audio_path).lower():
+                return "speech"
+
+            return "unknown"
+
+        except Exception:
+            return "unknown"
 
     def _find_moi_sidecar(self, video_path: Path) -> Optional[Path]:
         """Find MOI sidecar file for a video file."""

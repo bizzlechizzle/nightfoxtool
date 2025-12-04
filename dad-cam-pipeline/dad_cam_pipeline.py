@@ -43,9 +43,12 @@ from config.settings import PipelineConfig
 # Import phase scripts
 from scripts.discover import SourceDiscovery
 from scripts.analyze import VideoAnalyzer
+from scripts.detect_shots import ShotDetector
 from scripts.transcode import BatchTranscoder
 from scripts.audio_process import AudioProcessor
 from scripts.sync_multicam import MulticamSynchronizer
+from scripts.audio_mix import AudioMixAnalyzer
+from scripts.multicam_edit import MulticamEditor
 from scripts.assemble import TimelineAssembler
 
 
@@ -74,9 +77,13 @@ class DadCamPipeline:
             if not self._run_discovery():
                 return 1
 
-            # Phase 2: Analysis
+            # Phase 2: Analysis (stuck pixels, black frames, stability)
             if not self._run_analysis():
                 return 1
+
+            # Phase 3: Shot Detection (TransNet V2)
+            if not self._run_shot_detection():
+                self.logger.warning("Shot detection failed - continuing with basic switching")
 
             # Check for dry run
             if self.config.dry_run:
@@ -84,22 +91,30 @@ class DadCamPipeline:
                 self.logger.info("Dry run complete - no files processed")
                 return 0
 
-            # Phase 3: Transcoding
+            # Phase 4: Transcoding
             if not self.config.skip_transcode:
                 if not self._run_transcode():
                     return 1
             else:
                 self.logger.info("Skipping transcode (--skip-transcode)")
 
-            # Phase 4: Audio Processing
+            # Phase 5: Audio Processing
             if not self._run_audio_process():
                 return 1
 
-            # Phase 5: Multicam Sync (optional)
+            # Phase 6: Multicam Sync
             if not self.config.skip_multicam:
                 self._run_multicam_sync()
 
-            # Phase 6: Assembly
+            # Phase 7: Audio Mix Decisions
+            if not self._run_audio_mix():
+                self.logger.warning("Audio mix analysis failed - using camera audio only")
+
+            # Phase 8: Multicam Edit Decisions
+            if not self._run_multicam_edit():
+                self.logger.warning("Multicam edit failed - using single camera")
+
+            # Phase 9: Assembly
             if not self._run_assembly():
                 return 1
 
@@ -167,9 +182,25 @@ class DadCamPipeline:
                 phase.error(f"Analysis failed: {e}")
                 return False
 
+    def _run_shot_detection(self) -> bool:
+        """Run shot boundary detection phase."""
+        with PhaseLogger("PHASE 3: Shot Detection", self.logger) as phase:
+            try:
+                inventory = load_json(self.config.analysis_dir / "inventory.json")
+
+                detector = ShotDetector(self.config)
+                results = detector.detect_all(inventory)
+
+                self.results["shots"] = results
+                return True
+
+            except Exception as e:
+                phase.error(f"Shot detection failed: {e}")
+                return False
+
     def _run_transcode(self) -> bool:
         """Run transcode phase."""
-        with PhaseLogger("PHASE 3: Transcoding", self.logger) as phase:
+        with PhaseLogger("PHASE 4: Transcoding", self.logger) as phase:
             try:
                 # Load required data
                 inventory = load_json(self.config.analysis_dir / "inventory.json")
@@ -199,7 +230,7 @@ class DadCamPipeline:
 
     def _run_audio_process(self) -> bool:
         """Run audio processing phase."""
-        with PhaseLogger("PHASE 4: Audio Processing", self.logger) as phase:
+        with PhaseLogger("PHASE 5: Audio Processing", self.logger) as phase:
             try:
                 processor = AudioProcessor(self.config)
                 results = processor.process_all()
@@ -213,7 +244,7 @@ class DadCamPipeline:
 
     def _run_multicam_sync(self) -> bool:
         """Run multicam sync phase."""
-        with PhaseLogger("PHASE 5: Multicam Sync", self.logger) as phase:
+        with PhaseLogger("PHASE 6: Multicam Sync", self.logger) as phase:
             try:
                 inventory = load_json(self.config.analysis_dir / "inventory.json")
 
@@ -235,9 +266,66 @@ class DadCamPipeline:
                 phase.error(f"Multicam sync failed: {e}")
                 return False
 
+    def _run_audio_mix(self) -> bool:
+        """Run audio mix decisions phase."""
+        with PhaseLogger("PHASE 7: Audio Mix Analysis", self.logger) as phase:
+            try:
+                inventory = load_json(self.config.analysis_dir / "inventory.json")
+
+                # Check if we have external audio sources
+                audio_files = inventory.get("audio_sources", [])
+                if not audio_files:
+                    phase.step("No external audio sources - using camera audio")
+                    return True
+
+                sync_path = self.config.analysis_dir / "sync_offsets.json"
+                sync_data = load_json(sync_path) if sync_path.exists() else {}
+
+                analyzer = AudioMixAnalyzer(self.config)
+                results = analyzer.analyze_and_decide(inventory, sync_data)
+
+                self.results["audio_mix"] = results
+                return True
+
+            except Exception as e:
+                phase.error(f"Audio mix analysis failed: {e}")
+                return False
+
+    def _run_multicam_edit(self) -> bool:
+        """Run multicam edit decisions phase."""
+        with PhaseLogger("PHASE 8: Multicam Edit Decisions", self.logger) as phase:
+            try:
+                inventory = load_json(self.config.analysis_dir / "inventory.json")
+
+                # Check if we have multiple cameras
+                tripod_clips = inventory.get("tripod_camera", [])
+                if not tripod_clips:
+                    phase.step("No tripod camera - single camera edit")
+                    return True
+
+                # Load analysis data
+                stability_path = self.config.analysis_dir / "stability_scores.json"
+                stability_data = load_json(stability_path) if stability_path.exists() else {"clips": []}
+
+                shot_path = self.config.analysis_dir / "shot_boundaries.json"
+                shot_data = load_json(shot_path) if shot_path.exists() else {"clips": []}
+
+                sync_path = self.config.analysis_dir / "sync_offsets.json"
+                sync_data = load_json(sync_path) if sync_path.exists() else {}
+
+                editor = MulticamEditor(self.config)
+                results = editor.generate_decisions(inventory, stability_data, shot_data, sync_data)
+
+                self.results["multicam_edit"] = results
+                return True
+
+            except Exception as e:
+                phase.error(f"Multicam edit decisions failed: {e}")
+                return False
+
     def _run_assembly(self) -> bool:
         """Run assembly phase."""
-        with PhaseLogger("PHASE 6: Assembly", self.logger) as phase:
+        with PhaseLogger("PHASE 9: Assembly", self.logger) as phase:
             try:
                 # Load sync data if available
                 sync_path = self.config.analysis_dir / "sync_offsets.json"

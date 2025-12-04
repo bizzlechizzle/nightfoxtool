@@ -17,9 +17,9 @@ class TranscodeSettings:
     video_codec: str = "libx265"
     video_preset: str = "medium"
     video_crf: int = 18
-    pixel_format: str = "yuv420p10le"  # 4:2:0 10-bit for hardware decode
+    pixel_format: str = "yuv420p"  # 4:2:0 8-bit (matches source)
     video_tag: str = "hvc1"  # Apple QuickTime compatibility
-    video_profile: str = "main10"  # Main 10 profile for hardware decode
+    video_profile: str = "main"  # Main profile for 8-bit
 
     # Color metadata
     color_primaries: str = "bt709"
@@ -175,7 +175,7 @@ class PipelineConfig:
     logs_subdir: str = "logs"
 
     # Processing options
-    parallel_jobs: int = field(default_factory=lambda: max(1, os.cpu_count() // 2))
+    parallel_jobs: int = 2  # Conservative default for H.265 encoding
     skip_transcode: bool = False
     skip_multicam: bool = False
     dry_run: bool = False

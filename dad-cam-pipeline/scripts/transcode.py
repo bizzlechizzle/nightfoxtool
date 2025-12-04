@@ -84,10 +84,10 @@ def validate_output(output_path: Path) -> Tuple[bool, str]:
         if codec != "hevc":
             return False, f"Wrong codec: {codec} (expected hevc)"
 
-        # Check profile
+        # Check profile (Main or Main 10 both acceptable)
         profile = streams[0].get("profile", "")
-        if profile != "Main 10":
-            return False, f"Wrong profile: {profile} (expected Main 10)"
+        if profile not in ("Main", "Main 10"):
+            return False, f"Wrong profile: {profile} (expected Main or Main 10)"
 
         # Check bitrate
         bitrate_str = data.get("format", {}).get("bit_rate", "0")
@@ -458,11 +458,11 @@ def transcode_worker(job: TranscodeJob, config: PipelineConfig) -> Tuple[bool, s
     crf = settings.video_crf if settings.video_crf and settings.video_crf > 0 else 18
     cmd.extend(["-crf", str(crf)])
 
-    # Pixel format - 4:2:0 10-bit for hardware decode
-    cmd.extend(["-pix_fmt", "yuv420p10le"])
+    # Pixel format - 4:2:0 8-bit (matches source)
+    cmd.extend(["-pix_fmt", "yuv420p"])
 
-    # Profile - Main 10 for Mac hardware decode
-    cmd.extend(["-profile:v", "main10"])
+    # Profile - Main for 8-bit
+    cmd.extend(["-profile:v", "main"])
 
     # Tag - hvc1 for Apple QuickTime compatibility
     cmd.extend(["-tag:v", "hvc1"])

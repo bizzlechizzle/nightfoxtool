@@ -146,43 +146,89 @@ class TimelineAssembler:
 
     def _create_master_concat(self, clips: List[ClipInfo]) -> Optional[Path]:
         """
-        Create concatenated master file with J/L audio cuts.
+        Create concatenated master file with J/L audio crossfades.
 
-        Uses FFmpeg concat demuxer with audio crossfades.
+        Uses FFmpeg filter_complex for proper audio crossfades:
+        - Video: Hard cuts (no transitions)
+        - Audio: 0.25s linear crossfade at each cut point
+
+        For very long timelines (>20 clips), falls back to simple concat
+        to avoid filter_complex limitations.
         """
         settings = self.config.assembly
         master_path = self.master_dir / f"{self.config.output_prefix}_complete.mov"
+        crossfade_duration = 0.25  # 8 frames at 29.97fps
 
-        # For true J/L cuts with crossfades, we need filter_complex
-        # This is complex, so we'll do a simpler approach:
-        # 1. Concat with small audio crossfades
+        # For many clips, use batched approach to avoid filter_complex limits
+        if len(clips) > 20:
+            return self._create_master_batched(clips, master_path, crossfade_duration)
 
-        # Create concat file list
-        concat_list_path = self.config.analysis_dir / "concat_list.txt"
+        # Build filter_complex for audio crossfades
+        self.logger.info(f"  Creating master with {len(clips)} clips and audio crossfades...")
 
-        with open(concat_list_path, 'w') as f:
-            for clip in clips:
-                # Escape special characters in path
-                escaped_path = str(clip.path).replace("'", "'\\''")
-                f.write(f"file '{escaped_path}'\n")
+        # Build input arguments
+        input_args = []
+        for clip in clips:
+            input_args.extend(['-i', str(clip.path)])
 
-        # Build filter for audio crossfades between clips
-        # For simplicity, use concat demuxer with -safe 0
+        # Build filter_complex string
+        # Strategy: Chain audio crossfades while copying video
+        filter_parts = []
 
-        cmd = [
-            'ffmpeg', '-y',
-            '-f', 'concat',
-            '-safe', '0',
-            '-i', str(concat_list_path),
-            '-c:v', 'copy',  # Don't re-encode video
+        # For N clips, we need N-1 crossfades
+        # Each crossfade takes two audio streams and produces one
+
+        if len(clips) == 1:
+            # Single clip - just copy
+            filter_complex = "[0:v]copy[vout];[0:a]acopy[aout]"
+        else:
+            # Build video concat (no transitions - hard cuts)
+            v_inputs = "".join(f"[{i}:v]" for i in range(len(clips)))
+            filter_parts.append(f"{v_inputs}concat=n={len(clips)}:v=1:a=0[vout]")
+
+            # Build audio crossfade chain
+            # Start with first clip's audio
+            current_audio = "[0:a]"
+
+            for i in range(1, len(clips)):
+                next_audio = f"[{i}:a]"
+
+                if i < len(clips) - 1:
+                    # Intermediate crossfade - output to temporary
+                    out_label = f"[a{i}]"
+                else:
+                    # Final crossfade - output to aout
+                    out_label = "[aout]"
+
+                # Calculate duration for crossfade
+                # Crossfade happens at the END of current clip
+                prev_duration = clips[i-1].duration
+
+                # acrossfade filter: duration is crossfade length, curve is crossfade shape
+                filter_parts.append(
+                    f"{current_audio}{next_audio}acrossfade=d={crossfade_duration}:c1=tri:c2=tri{out_label}"
+                )
+
+                current_audio = out_label
+
+            filter_complex = ";".join(filter_parts)
+
+        # Build full command
+        cmd = ['ffmpeg', '-y']
+        cmd.extend(input_args)
+        cmd.extend([
+            '-filter_complex', filter_complex,
+            '-map', '[vout]',
+            '-map', '[aout]',
+            '-c:v', 'copy',  # Don't re-encode video (already H.265)
             '-c:a', 'aac',
             '-b:a', '256k',
             '-movflags', '+faststart',
             str(master_path)
-        ]
+        ])
 
         try:
-            self.logger.info(f"  Concatenating {len(clips)} clips...")
+            self.logger.info(f"  Running FFmpeg with audio crossfades...")
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -191,11 +237,13 @@ class TimelineAssembler:
             )
 
             if result.returncode != 0:
-                self.logger.error(f"Concat failed: {result.stderr[-500:]}")
-                return None
+                self.logger.warning(f"Crossfade concat failed, trying simple concat...")
+                self.logger.debug(f"Error: {result.stderr[-1000:]}")
+                # Fall back to simple concat
+                return self._create_master_simple(clips, master_path)
 
             if not master_path.exists():
-                return None
+                return self._create_master_simple(clips, master_path)
 
             # Verify output
             info = probe_file(master_path)
@@ -209,7 +257,177 @@ class TimelineAssembler:
             self.logger.error("Concat timed out")
             return None
         except Exception as e:
-            self.logger.error(f"Concat error: {e}")
+            self.logger.warning(f"Crossfade concat error: {e}, trying simple concat...")
+            return self._create_master_simple(clips, master_path)
+
+    def _create_master_batched(
+        self,
+        clips: List[ClipInfo],
+        master_path: Path,
+        crossfade_duration: float
+    ) -> Optional[Path]:
+        """
+        Create master by processing clips in batches.
+
+        For long timelines, process in batches of 20 clips,
+        then concat the batches.
+        """
+        import tempfile
+        batch_size = 20
+        temp_files = []
+
+        try:
+            # Process in batches
+            for i in range(0, len(clips), batch_size):
+                batch = clips[i:i + batch_size]
+                batch_num = i // batch_size + 1
+                total_batches = (len(clips) + batch_size - 1) // batch_size
+
+                self.logger.info(f"  Processing batch {batch_num}/{total_batches} ({len(batch)} clips)...")
+
+                # Create temp file for batch
+                temp_path = self.config.analysis_dir / f"batch_{batch_num:03d}.mov"
+                temp_files.append(temp_path)
+
+                # Process batch with crossfades
+                batch_result = self._create_batch_with_crossfades(batch, temp_path, crossfade_duration)
+                if not batch_result:
+                    # Fall back to simple concat for this batch
+                    self._create_master_simple(batch, temp_path)
+
+            # Now concat all batches (simple concat is fine between batches)
+            self.logger.info(f"  Concatenating {len(temp_files)} batches...")
+
+            concat_list = self.config.analysis_dir / "batch_concat.txt"
+            with open(concat_list, 'w') as f:
+                for temp in temp_files:
+                    f.write(f"file '{temp}'\n")
+
+            cmd = [
+                'ffmpeg', '-y',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', str(concat_list),
+                '-c', 'copy',
+                '-movflags', '+faststart',
+                str(master_path)
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+
+            if result.returncode != 0:
+                self.logger.error(f"Batch concat failed: {result.stderr[-500:]}")
+                return None
+
+            # Verify output
+            info = probe_file(master_path)
+            if info:
+                self.logger.info(f"  Master duration: {info.duration/60:.1f} minutes")
+                self.logger.info(f"  Master size: {master_path.stat().st_size / (1024*1024*1024):.2f} GB")
+
+            return master_path
+
+        finally:
+            # Cleanup temp files
+            for temp in temp_files:
+                if temp.exists():
+                    temp.unlink()
+
+    def _create_batch_with_crossfades(
+        self,
+        clips: List[ClipInfo],
+        output_path: Path,
+        crossfade_duration: float
+    ) -> bool:
+        """Create a single batch with audio crossfades."""
+        if len(clips) == 1:
+            # Just copy single clip
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', str(clips[0].path),
+                '-c', 'copy',
+                str(output_path)
+            ]
+            result = subprocess.run(cmd, capture_output=True, timeout=600)
+            return result.returncode == 0
+
+        # Build filter_complex for batch
+        input_args = []
+        for clip in clips:
+            input_args.extend(['-i', str(clip.path)])
+
+        # Video concat
+        v_inputs = "".join(f"[{i}:v]" for i in range(len(clips)))
+        filter_parts = [f"{v_inputs}concat=n={len(clips)}:v=1:a=0[vout]"]
+
+        # Audio crossfade chain
+        current_audio = "[0:a]"
+        for i in range(1, len(clips)):
+            next_audio = f"[{i}:a]"
+            out_label = "[aout]" if i == len(clips) - 1 else f"[a{i}]"
+            filter_parts.append(
+                f"{current_audio}{next_audio}acrossfade=d={crossfade_duration}:c1=tri:c2=tri{out_label}"
+            )
+            current_audio = out_label
+
+        filter_complex = ";".join(filter_parts)
+
+        cmd = ['ffmpeg', '-y']
+        cmd.extend(input_args)
+        cmd.extend([
+            '-filter_complex', filter_complex,
+            '-map', '[vout]',
+            '-map', '[aout]',
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-b:a', '256k',
+            str(output_path)
+        ])
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        return result.returncode == 0
+
+    def _create_master_simple(self, clips: List[ClipInfo], master_path: Path) -> Optional[Path]:
+        """
+        Simple concat fallback without crossfades.
+
+        Used when filter_complex approach fails.
+        """
+        self.logger.info(f"  Using simple concat for {len(clips)} clips...")
+
+        concat_list = self.config.analysis_dir / "concat_list.txt"
+        with open(concat_list, 'w') as f:
+            for clip in clips:
+                escaped_path = str(clip.path).replace("'", "'\\''")
+                f.write(f"file '{escaped_path}'\n")
+
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', str(concat_list),
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-b:a', '256k',
+            '-movflags', '+faststart',
+            str(master_path)
+        ]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+
+            if result.returncode != 0:
+                self.logger.error(f"Simple concat failed: {result.stderr[-500:]}")
+                return None
+
+            info = probe_file(master_path)
+            if info:
+                self.logger.info(f"  Master duration: {info.duration/60:.1f} minutes")
+
+            return master_path
+
+        except Exception as e:
+            self.logger.error(f"Simple concat error: {e}")
             return None
 
     def _generate_fcpxml(self, clips: List[ClipInfo]) -> Optional[Path]:
