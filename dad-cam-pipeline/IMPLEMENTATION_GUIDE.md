@@ -2,6 +2,81 @@
 
 A comprehensive guide for developers to understand, extend, and maintain this pipeline.
 
+---
+
+## RECOMMENDED: Simplified Pipeline (v2.0)
+
+**Date:** December 4, 2024
+**Status:** VERIFIED - 100% Score, Grade A
+
+### Quick Start
+
+```bash
+cd dad-cam-pipeline
+source .venv/bin/activate
+python pipeline_simple.py --source "/path/to/footage" --output "/path/to/output"
+```
+
+### Simplified 4-Phase Architecture
+
+| Phase | Script | Purpose |
+|-------|--------|---------|
+| 1 | `discover.py` | Find files, parse MOI metadata |
+| 2 | `transcode.py` | TOD/MTS → H.265 MOV |
+| 3 | `audio_process.py` | Loudnorm to -14 LUFS |
+| 4 | `assemble_simple.py` | Concat → timeline |
+
+### Key Files (Simplified)
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `pipeline_simple.py` | 428 | Main entry point |
+| `scripts/assemble_simple.py` | 570 | Timeline assembly |
+| `scripts/audit_pipeline.py` | 280 | Output verification |
+
+### Sample Rate Handling
+
+Legacy clips may have mixed 48kHz/96kHz audio. The simplified assembler handles this:
+
+```python
+sample_rates = set(c.sample_rate for c in clips)
+if len(sample_rates) == 1:
+    # Fast path: stream copy
+    self._create_timeline_simple(clips, output_path)
+else:
+    # Pre-process each clip to 48kHz
+    self._create_timeline_normalized(clips, output_path)
+```
+
+### Verification
+
+```bash
+python scripts/audit_pipeline.py --output "/path/to/output"
+```
+
+Expected output:
+```
+Tests: 6/6 passed
+Score: 100.0%
+Grade: A
+```
+
+### Output Structure
+
+```
+Output/
+├── clips/           # dad_cam_001.mov ... 115, tripod_cam_001..004
+├── timeline/        # dad_cam_main_timeline.mov, dad_cam_tripod_timeline.mov
+├── analysis/        # inventory.json, audit_report.json
+└── logs/
+```
+
+---
+
+## Original Pipeline Documentation (v1.0)
+
+The sections below document the original 9-phase pipeline, which has known issues.
+
 ## Table of Contents
 
 1. [Architecture Overview](#architecture-overview)

@@ -1,106 +1,149 @@
 # Dad Cam Pipeline
 
-Legacy camcorder footage processing pipeline for TOD/MTS files with multicam support.
+Legacy camcorder footage processing pipeline for TOD/MTS files.
 
-## Quick Start
+## Quick Start (Recommended)
 
 ```bash
 cd dad-cam-pipeline
 source .venv/bin/activate
-python dad_cam_pipeline.py --source "/path/to/footage" --output "/path/to/output"
+python pipeline_simple.py --source "/path/to/footage" --output "/path/to/output"
 ```
 
-## Pipeline Phases
+## Pipelines
+
+### Simplified Pipeline (RECOMMENDED)
+
+Use `pipeline_simple.py` - a streamlined 4-phase pipeline:
 
 | Phase | Script | Purpose |
 |-------|--------|---------|
 | 1 | `discover.py` | Scan source folders, build inventory.json |
-| 2 | `shot_detect.py` | Detect scene changes for smart cuts |
-| 3 | `stability.py` | Analyze camera shake for multicam switching |
-| 4 | `transcode.py` | Convert TOD/MTS to H.265 MOV |
-| 5 | `audio_process.py` | Process external audio files |
-| 6 | `sync_multicam.py` | Cross-correlate audio for sync offsets |
-| 7 | `audio_mix.py` | Decide lapel vs camera audio per segment |
-| 8 | `multicam_edit.py` | Generate camera switch decisions |
-| 9 | `assemble.py` | Create master files and FCPXML |
+| 2 | `transcode.py` | Convert TOD/MTS to H.265 MOV |
+| 3 | `audio_process.py` | Two-pass loudnorm to -14 LUFS, remove hum |
+| 4 | `assemble_simple.py` | Concat clips into continuous timeline |
+
+```bash
+# Full pipeline
+python pipeline_simple.py --source "/footage" --output "/output"
+
+# Skip phases (use existing clips)
+python pipeline_simple.py -s /footage -o /output --skip-transcode --skip-audio
+```
+
+### Original Pipeline (Complex)
+
+The original `dad_cam_pipeline.py` has 9 phases with multicam support, but has known issues with audio sync and decision application.
 
 ## Output Structure
 
 ```
 Output/
 ├── clips/           # Transcoded H.265 clips
-│   ├── dad_cam_001.mov ... dad_cam_NNN.mov (main camera)
-│   └── tripod_cam_001.mov ... (tripod camera)
-├── master/
-│   ├── dad_cam_complete.mov          # Combined master
-│   ├── dad_cam_main_camera_docedit.mov    # Main camera only, J/L crossfades
-│   └── dad_cam_tripod_camera_docedit.mov  # Tripod camera only, J/L crossfades
-├── project/
-│   ├── dad_cam_timeline.fcpxml       # FCP timeline
-│   └── dad_cam_multicam.fcpxml       # FCP multicam
+│   ├── dad_cam_001.mov ... dad_cam_NNN.mov
+│   └── tripod_cam_001.mov ...
+├── timeline/        # Continuous edits per camera
+│   ├── dad_cam_main_timeline.mov
+│   └── dad_cam_tripod_timeline.mov
 ├── analysis/        # JSON decision files
 │   ├── inventory.json
-│   ├── audio_mix_decisions.json
-│   ├── multicam_edit_decisions.json
-│   └── sync_offsets.json
+│   └── assembly_results.json
 └── logs/            # Pipeline logs
 ```
 
-## Key Features
+## Implementation Guide
 
-### Doc Edits (Per-Camera VHS-Style Output)
-- Creates separate master files for each camera source
-- Uses 1-second S-curve (esin) audio crossfades at edit points
-- Video: stream copy (no re-encode)
-- Audio: AAC 256k with smooth J/L transitions
+### Assembly Strategy
 
-### Decision Files (Generated but NOT YET applied to master)
-- `audio_mix_decisions.json` - When to use lapel vs camera audio
-- `multicam_edit_decisions.json` - Camera switch points
-- `sync_offsets.json` - Audio sync alignment
+The simplified assembly uses a robust approach to handle clips with different audio sample rates (48kHz vs 96kHz):
 
-**KNOWN ISSUE:** The master file (`dad_cam_complete.mov`) does NOT apply these decisions yet. It's a simple concatenation. The doc edits provide working output while full decision application is pending.
+1. **Detect sample rates** - Check all clips for audio sample rate
+2. **If uniform** - Use FFmpeg concat demuxer with stream copy (fastest)
+3. **If mixed** - Pre-process each clip to normalize audio to 48kHz, then concat
 
-## Skip Flags
+This avoids AAC decoder errors that occur when trying to decode/re-encode across clip boundaries with different audio formats.
+
+### Key Code: `assemble_simple.py`
+
+```python
+# Detection
+sample_rates = set(c.sample_rate for c in clips)
+
+if len(sample_rates) == 1:
+    # Stream copy - fast path
+    success = self._create_timeline_simple(clips, output_path)
+else:
+    # Normalize each clip first, then concat
+    success = self._create_timeline_normalized(clips, output_path)
+```
+
+### Verification
+
+Every timeline is verified for audio/video duration match:
+
+```python
+def verify_timeline(path: Path) -> Dict:
+    # Get video and audio durations separately
+    # Gap < 1.0s is acceptable
+    results["duration_match"] = gap < 1.0
+```
+
+## Technical Notes
+
+### Audio Sample Rate Issue
+
+Legacy camcorder clips may have mixed sample rates:
+- Main camera: Some clips at 48kHz, some at 96kHz
+- Tripod camera: Same issue
+
+**Solution**: Pre-process each clip individually to 48kHz before concatenation.
+
+### FFmpeg Concat Demuxer
+
+The concat demuxer requires:
+- Same codec for all streams being stream-copied
+- Same sample rate for audio stream copy
+- Proper escaping of file paths with spaces/special chars
 
 ```bash
---skip-analysis    # Skip phases 1-3
---skip-transcode   # Skip phase 4
---skip-audio       # Skip phase 5
+# Create concat list
+file '/path/to/clip1.mov'
+file '/path/to/clip2.mov'
+
+# Execute concat
+ffmpeg -f concat -safe 0 -i list.txt -c copy output.mov
 ```
+
+### Audio Normalization
+
+Clips are normalized to -14 LUFS using two-pass loudnorm:
+1. First pass: Analyze (measure integrated, true peak, LRA)
+2. Second pass: Apply normalization with measured values
+
+60Hz hum detection and removal via highpass/lowpass notch filter.
 
 ## Dependencies
 
 - Python 3.10+
 - FFmpeg with libx265
+- exiftool (for MOI metadata)
 - numpy, scipy (for audio analysis)
 
-## Files Modified in This Session
+## Files
 
-| File | Changes |
+| File | Purpose |
 |------|---------|
-| `scripts/assemble.py` | Added doc edit feature with J/L crossfades |
-| `scripts/transcode.py` | Added -shortest flag to prevent audio/video drift |
-| `scripts/fix_audio_sync.py` | NEW: Fix existing clips with audio drift using atrim |
-| `scripts/audio_process.py` | Fixed FCPXML encoding (text mode) |
-| `dad_cam_pipeline.py` | Added --skip-audio flag |
-| `AUDIT_REPORT.md` | Documents 10 critical issues with pipeline |
-| `AUDIO_SYNC_FIX.md` | Implementation guide for audio sync fix |
-| `FIX_PLAN.md` | Detailed fix plan for decision application |
-| `IMPLEMENTATION_GUIDE.md` | Step-by-step guide for developers |
+| `pipeline_simple.py` | Simplified 4-phase pipeline (RECOMMENDED) |
+| `scripts/assemble_simple.py` | Robust timeline assembly |
+| `scripts/discover.py` | Source file discovery |
+| `scripts/transcode.py` | Video transcoding |
+| `scripts/audio_process.py` | Audio normalization |
 
-## Critical Issues (See AUDIT_REPORT.md)
+## Verified Results
 
-1. Audio mix decisions generated but never applied
-2. Multicam edit decisions generated but never applied
-3. Sync offsets never applied during assembly
-4. Master uses simple concat, not intelligent mixing
+Last run (Dec 4, 2024):
 
-## Current Work In Progress
-
-**Audio Sync Fix (WIP - NOT COMPLETE)**
-- Added `-shortest` flag to transcode.py
-- Created fix_audio_sync.py script using atrim filter
-- Fixed 71/119 clips (4.7s drift eliminated)
-- Doc edits regenerated but **still have issues**
-- Need to debug remaining sync/crossfade problems
+| Camera | Clips | Duration | Audio Gap | Size | Status |
+|--------|-------|----------|-----------|------|--------|
+| Main | 115 | 122.4 min | 0.00s | 9.74 GB | OK |
+| Tripod | 4 | 64.8 min | 0.00s | 4.77 GB | OK |
